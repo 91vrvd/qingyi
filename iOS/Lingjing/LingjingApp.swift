@@ -755,8 +755,10 @@ struct TranslationReadinessView: View {
             VStack(alignment: .leading, spacing: 4) {
                 Label(status, systemImage: "arrow.down.circle")
                 if speech {
-                    Text(SFSpeechRecognizer(locale: Locale(identifier: source.speechLocale))?.supportsOnDeviceRecognition == true
-                         ? "本机语音识别可用" : "本机语音识别尚不可用，点击查看")
+                    let speechRecognizer = SFSpeechRecognizer(locale: Locale(identifier: source.speechLocale))
+                    Text(speechRecognizer?.supportsOnDeviceRecognition == true
+                         ? "本机语音识别可用"
+                         : (speechRecognizer?.isAvailable == true ? "在线语音识别可用（未下载本机模型）" : "当前语种语音识别暂不可用"))
                 }
             }.font(.caption)
         }
@@ -892,6 +894,11 @@ extension View {
         // Translation availability is a pair property. A language appears in
         // both pickers when any installed pair includes it; the selected pair
         // is checked separately by TranslationReadinessView.
+        if MLKitEngine.preferFast {
+            for lang in AppLanguage.targets where MLKitEngine.modelDownloaded(lang.code) {
+                installed.insert(lang)
+            }
+        }
         for fromLanguage in AppLanguage.targets {
             guard let from = fromLanguage.code else { continue }
             for toLanguage in AppLanguage.targets where fromLanguage != toLanguage {

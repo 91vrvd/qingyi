@@ -14,6 +14,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
     private let group = "group.com.liu.lingjing.translate"
     private var voiceMode = false
     private var lastModeCheck = Date.distantPast
+    private var lastStateRefresh = Date.distantPast
     private var audioBytes = Data()
     private var audioFrames = 0
     private var audioRate: UInt32 = 0
@@ -84,8 +85,13 @@ final class SampleHandler: RPBroadcastSampleHandler {
                     code: 0, userInfo: [NSLocalizedDescriptionKey: "语音字幕已关闭"]))
                 return
             }
-            voiceMode = FileManager.default.fileExists(
+            let nextVoiceMode = FileManager.default.fileExists(
                 atPath: folder.appendingPathComponent("voice.mode").path)
+            if (nextVoiceMode && !voiceMode) || Date().timeIntervalSince(lastStateRefresh) > 0.8 {
+                writeState("running", to: folder)
+                lastStateRefresh = Date()
+            }
+            voiceMode = nextVoiceMode
             let parts = ((try? String(contentsOf: folder.appendingPathComponent("pip-region.txt"),
                                       encoding: .utf8)) ?? "")
                 .split(separator: ",").compactMap { Double($0) }
@@ -186,32 +192,82 @@ final class SampleHandler: RPBroadcastSampleHandler {
         guard let description = CMSampleBufferGetFormatDescription(sample),
               let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(description)?.pointee,
               asbd.mFormatID == kAudioFormatLinearPCM,
-              asbd.mBitsPerChannel == 16,
               asbd.mChannelsPerFrame >= 1, asbd.mChannelsPerFrame <= 2,
-              asbd.mBytesPerFrame == asbd.mChannelsPerFrame * 2,
-              asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved == 0,
               let block = CMSampleBufferGetDataBuffer(sample) else { return }
         let length = CMBlockBufferGetDataLength(block)
         let frames = CMSampleBufferGetNumSamples(sample)
-        guard frames > 0, length >= frames * Int(asbd.mBytesPerFrame) else { return }
+        guard frames > 0 else { return }
         let rate = UInt32(asbd.mSampleRate)
         let channels = UInt8(asbd.mChannelsPerFrame)
-        let bigEndian = asbd.mFormatFlags & kAudioFormatFlagIsBigEndian != 0
-        if audioFrames > 0 && (rate != audioRate || channels != audioChannels
-                                || bigEndian != audioBigEndian) {
-            flushAudio(to: folder)
+        let isFloat = (asbd.mFormatFlags & kAudioFormatFlagIsFloat) != 0
+        let nonInterleaved = (asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0
+        let bigEndian = (asbd.mFormatFlags & kAudioFormatFlagIsBigEndian) != 0
+
+        if asbd.mBitsPerChannel == 16 && !isFloat && !nonInterleaved && asbd.mBytesPerFrame == asbd.mChannelsPerFrame * 2 {
+            guard length >= frames * Int(asbd.mBytesPerFrame) else { return }
+            if audioFrames > 0 && (rate != audioRate || channels != audioChannels || bigEndian != audioBigEndian) {
+                flushAudio(to: folder)
+            }
+            audioRate = rate
+            audioChannels = channels
+            audioBigEndian = bigEndian
+            var bytes = Data(count: frames * Int(asbd.mBytesPerFrame))
+            let status = bytes.withUnsafeMutableBytes { pointer in
+                CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: pointer.count,
+                                           destination: pointer.baseAddress!)
+            }
+            guard status == noErr else { return }
+            audioBytes.append(bytes)
+            audioFrames += frames
+        } else if (asbd.mBitsPerChannel == 32 && isFloat) || (asbd.mBitsPerChannel == 16 && !isFloat && nonInterleaved) {
+            let bytesPerSample = Int(asbd.mBitsPerChannel / 8)
+            let chCount = Int(channels)
+            let needed = frames * chCount * bytesPerSample
+            guard length >= needed else { return }
+            var raw = Data(count: needed)
+            let status = raw.withUnsafeMutableBytes { pointer in
+                CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: needed,
+                                           destination: pointer.baseAddress!)
+            }
+            guard status == noErr else { return }
+            if audioFrames > 0 && (rate != audioRate || channels != audioChannels || audioBigEndian != false) {
+                flushAudio(to: folder)
+            }
+            audioRate = rate
+            audioChannels = channels
+            audioBigEndian = false
+            var converted = Data(count: frames * chCount * 2)
+            raw.withUnsafeBytes { srcRaw in
+                converted.withUnsafeMutableBytes { dstRaw in
+                    guard let dst = dstRaw.bindMemory(to: Int16.self).baseAddress else { return }
+                    if isFloat {
+                        guard let src = srcRaw.bindMemory(to: UInt32.self).baseAddress else { return }
+                        for frame in 0..<frames {
+                            for ch in 0..<chCount {
+                                let srcIdx = nonInterleaved ? (ch * frames + frame) : (frame * chCount + ch)
+                                let bits = bigEndian ? UInt32(bigEndian: src[srcIdx]) : UInt32(littleEndian: src[srcIdx])
+                                let val = Float(bitPattern: bits)
+                                let clamped = max(-1.0, min(1.0, val.isFinite ? val : 0))
+                                dst[frame * chCount + ch] = Int16(clamping: Int(clamped * 32767.0)).littleEndian
+                            }
+                        }
+                    } else {
+                        guard let src = srcRaw.bindMemory(to: Int16.self).baseAddress else { return }
+                        for frame in 0..<frames {
+                            for ch in 0..<chCount {
+                                let sample16 = src[ch * frames + frame]
+                                let host = bigEndian ? Int16(bigEndian: sample16) : Int16(littleEndian: sample16)
+                                dst[frame * chCount + ch] = host.littleEndian
+                            }
+                        }
+                    }
+                }
+            }
+            audioBytes.append(converted)
+            audioFrames += frames
+        } else {
+            return
         }
-        audioRate = rate
-        audioChannels = channels
-        audioBigEndian = bigEndian
-        var bytes = Data(count: frames * Int(asbd.mBytesPerFrame))
-        let status = bytes.withUnsafeMutableBytes { pointer in
-            CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: pointer.count,
-                                       destination: pointer.baseAddress!)
-        }
-        guard status == noErr else { return }
-        audioBytes.append(bytes)
-        audioFrames += frames
         if audioFrames >= Int(asbd.mSampleRate * 0.20) { flushAudio(to: folder) }
     }
 

@@ -2005,8 +2005,12 @@ final class SampleVideoView: UIView {
     }
 
     func startVoice(autoOnBackground: Bool = false) {
-        beginSession()
+        beginSession(persistentRetries: !autoOnBackground)
         configureIfNeeded()
+        if voiceCaption != nil {
+            show(image: nil, blocks: [])
+        }
+        controller?.invalidatePlaybackState()
         if !autoOnBackground { ensureStarted() }
     }
 
@@ -2175,8 +2179,12 @@ final class SampleVideoView: UIView {
         qyLog("pip launchStart attempt \(startAttempts) possible=\(controller?.isPictureInPicturePossible == true) appState=\(UIApplication.shared.applicationState.rawValue)")
         startTask = Task { @MainActor in
             defer { startTask = nil }
-            for _ in 0..<300 {
+            for step in 0..<300 {
                 if Task.isCancelled || !autoStartEnabled { return }
+                if step > 0, step % 12 == 0, controller?.isPictureInPicturePossible != true, voiceCaption != nil {
+                    show(image: nil, blocks: [])
+                    controller?.invalidatePlaybackState()
+                }
                 // Starting while the system broadcast sheet still covers the app
                 // fails and costs a retry; wait for the app to become active.
                 if let controller, controller.isPictureInPicturePossible,

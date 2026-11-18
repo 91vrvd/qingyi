@@ -140,6 +140,7 @@ struct VoiceSession: Identifiable, Codable {
     private var phoneFinishing = false
     private var phoneArmedAt: Date?
     private var starting = false
+    private var useOnDeviceRecognition = true
     private var recognitionGeneration = 0
     private var lastCommitted = ""
     private var historyIDs: [Int: UUID] = [:]
@@ -224,6 +225,14 @@ struct VoiceSession: Identifiable, Codable {
             let page = (words.count - 1) / 14
             return ("\(clauses.count - 1):\(page)", words.dropFirst(page * 14).joined(separator: " "))
         }
+        // CJK languages (Japanese, Chinese, etc.) have no whitespace between words;
+        // paginate long clauses by character count so PiP subtitles stay readable.
+        if clause.count > 28 {
+            let pageSize = 24
+            let page = (clause.count - 1) / pageSize
+            let start = clause.index(clause.startIndex, offsetBy: page * pageSize)
+            return ("\(clauses.count - 1):\(page)", String(clause[start...]))
+        }
         return ("\(clauses.count - 1):0", clause)
     }
 
@@ -255,10 +264,16 @@ struct VoiceSession: Identifiable, Codable {
 
     /// The system 屏幕共享 sheet was opened for 手机声音; shown as 等待系统确认.
     @Published private(set) var awaitingSystem = false
+    @Published private(set) var startError: String?
     private var awaitingSince = Date.distantPast
+
+    func clearStartError() {
+        startError = nil
+    }
 
     func beginAwaitingSystem() {
         guard !isRunning, audioSource == .phone else { return }
+        startError = nil
         armPhoneBroadcast()
         awaitingSystem = true
         awaitingSince = Date()
@@ -276,45 +291,116 @@ struct VoiceSession: Identifiable, Codable {
         if let folder = groupFolder { try? FileManager.default.removeItem(at: folder.appendingPathComponent("voice.mode")) }
     }
 
+    private func failStart(_ reason: String, stopBroadcast: Bool = false) {
+        awaitingSystem = false
+        phoneArmedAt = nil
+        startError = reason
+        message = reason
+        if stopBroadcast, audioSource == .phone, let groupFolder {
+            try? FileManager.default.removeItem(at: groupFolder.appendingPathComponent("voice.mode"))
+            try? "stop".write(to: groupFolder.appendingPathComponent("voice.stop"),
+                              atomically: true, encoding: .utf8)
+        }
+    }
+
+    /// Check translation readiness and speech recognition availability before
+    /// presenting the system broadcast sheet so non-English pairs do not hang
+    /// at "等待系统确认" when a pack or permission is missing.
+    func preflightPhoneStart() async -> (error: String?, needsLanguagePack: Bool) {
+        startError = nil
+        let sourceCode = source.code ?? "en"
+        if source != target {
+            let fastReady = MLKitEngine.shared.canServe(source: sourceCode, target: target.code ?? "zh-Hans")
+            if !fastReady {
+                let state = await translator.status(for: sourceCode, target: target)
+                if state != .installed {
+                    let msg = state == .unsupported
+                        ? "这组翻译语言暂不支持"
+                        : "请先下载 \(source.rawValue) → \(target.rawValue) 翻译语言包或离线模型"
+                    failStart(msg)
+                    return (msg, state != .unsupported)
+                }
+            } else {
+                MLKitEngine.shared.prepare(source: sourceCode, target: target.code ?? "zh-Hans")
+            }
+        }
+        let status = await withCheckedContinuation { continuation in
+            SFSpeechRecognizer.requestAuthorization { continuation.resume(returning: $0) }
+        }
+        guard status == .authorized else {
+            let msg = "请在系统设置中允许语音识别"
+            failStart(msg)
+            return (msg, false)
+        }
+        let speechRecognizer = SFSpeechRecognizer(locale: Locale(identifier: source.speechLocale))
+        guard let speechRecognizer, speechRecognizer.isAvailable else {
+            let msg = "\(source.rawValue)语音识别当前不可用（请检查网络或系统听写设置）"
+            failStart(msg)
+            return (msg, false)
+        }
+        return (nil, false)
+    }
+
     func start() {
         guard !isRunning, !starting else { return }
         starting = true
+        startError = nil
         Task {
             defer { starting = false }
+            let sourceCode = source.code ?? "en"
             // With the fast offline engine selected and its models downloaded,
             // Apple's language pack is not required to start.
-            let fastReady = MLKitEngine.shared.canServe(source: source.code ?? "en",
+            let fastReady = MLKitEngine.shared.canServe(source: sourceCode,
                                                         target: target.code ?? "zh-Hans")
             if source != target && !fastReady {
-                let state = await translator.status(for: source.code ?? "en", target: target)
+                let state = await translator.status(for: sourceCode, target: target)
                 guard state == .installed else {
-                    message = state == .unsupported ? "这组翻译语言暂不支持" : "请先点语言包状态，下载 \(source.rawValue) → \(target.rawValue)"
+                    failStart(state == .unsupported ? "这组翻译语言暂不支持" : "请先点语言包状态，下载 \(source.rawValue) → \(target.rawValue)",
+                              stopBroadcast: audioSource == .phone)
                     return
                 }
+            } else if source != target {
+                MLKitEngine.shared.prepare(source: sourceCode, target: target.code ?? "zh-Hans")
             }
             let status = await withCheckedContinuation { continuation in
                 SFSpeechRecognizer.requestAuthorization { continuation.resume(returning: $0) }
             }
-            guard status == .authorized else { message = "请在设置中允许语音识别"; return }
+            guard status == .authorized else {
+                failStart("请在设置中允许语音识别", stopBroadcast: audioSource == .phone)
+                return
+            }
             if audioSource == .microphone {
                 let mic = await AVAudioApplication.requestRecordPermission()
-                guard mic else { message = "请在设置中允许麦克风"; return }
+                guard mic else {
+                    failStart("请在设置中允许麦克风")
+                    return
+                }
             }
             recognizer = SFSpeechRecognizer(locale: Locale(identifier: source.speechLocale))
-            guard let recognizer, recognizer.isAvailable else { message = "当前语种的语音识别不可用"; return }
-            guard recognizer.supportsOnDeviceRecognition else { message = "此设备暂不支持该语种的离线识别"; return }
+            guard let recognizer, recognizer.isAvailable else {
+                failStart("当前语种（\(source.rawValue)）的语音识别暂不可用", stopBroadcast: audioSource == .phone)
+                return
+            }
+            // Prefer on-device recognition when available, but allow online
+            // recognition fallback so non-English languages (e.g. Japanese,
+            // Chinese) without downloaded dictation packs still work and open PiP.
+            useOnDeviceRecognition = recognizer.supportsOnDeviceRecognition
             do {
                 if audioSource == .microphone {
                     try AVAudioSession.sharedInstance().setCategory(.playAndRecord, mode: .default,
                         options: [.mixWithOthers, .defaultToSpeaker])
                     try AVAudioSession.sharedInstance().setActive(true)
                 } else {
-                    guard let groupFolder else { message = "共享容器不可用"; return }
+                    guard let groupFolder else {
+                        failStart("共享容器不可用", stopBroadcast: true)
+                        return
+                    }
                     try? FileManager.default.removeItem(
                         at: groupFolder.appendingPathComponent("voice.stop"))
                     try "phone".write(to: groupFolder.appendingPathComponent("voice.mode"),
                                       atomically: true, encoding: .utf8)
                 }
+                awaitingSystem = false
                 startedAt = Date()
                 lastAudioAt = .distantPast
                 observedBroadcast = false
@@ -366,14 +452,15 @@ struct VoiceSession: Identifiable, Codable {
                     tapInstalled = true
                     engine.prepare()
                     try engine.start()
-                    message = "正在收听麦克风（本机识别）"
+                    message = useOnDeviceRecognition ? "正在收听麦克风（本机识别）" : "正在收听麦克风（在线识别）"
                 } else {
                     message = "等待系统广播开始；请在系统面板确认"
                 }
-                updatePiP()
+                pip.beginSession(persistentRetries: audioSource == .phone)
+                updatePiP(force: true)
                 pip.startVoice(autoOnBackground: audioSource == .microphone)
             } catch {
-                message = "麦克风启动失败：\(error.localizedDescription)"
+                failStart("启动失败：\(error.localizedDescription)", stopBroadcast: audioSource == .phone)
                 stop()
             }
         }
@@ -387,7 +474,7 @@ struct VoiceSession: Identifiable, Codable {
         request?.endAudio()
         let next = SFSpeechAudioBufferRecognitionRequest()
         next.shouldReportPartialResults = true
-        next.requiresOnDeviceRecognition = true
+        next.requiresOnDeviceRecognition = useOnDeviceRecognition
         request = next
         recognitionTask = recognizer?.recognitionTask(with: next) { [weak self] result, error in
             Task { @MainActor in
@@ -417,6 +504,15 @@ struct VoiceSession: Identifiable, Codable {
                         self.schedulePartial(text)
                     }
                 } else if let error {
+                    // If on-device recognition fails (common when a non-English
+                    // dictation model is incomplete), fall back to online
+                    // recognition instead of tearing down PiP immediately.
+                    if self.useOnDeviceRecognition {
+                        self.useOnDeviceRecognition = false
+                        self.message = self.audioSource == .phone ? "已切换在线识别，正在收听手机声音" : "已切换在线识别，正在收听麦克风"
+                        self.startRecognitionTask()
+                        return
+                    }
                     self.message = "语音识别中断：\(error.localizedDescription)"
                     self.stop()
                 }
@@ -436,9 +532,11 @@ struct VoiceSession: Identifiable, Codable {
         if !isRunning, !starting, audioSource == .phone,
            let armed = phoneArmedAt, let folder = groupFolder {
             let stateURL = folder.appendingPathComponent("capture.state")
-            let modified = (try? stateURL.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+            let attrs = try? FileManager.default.attributesOfItem(atPath: stateURL.path)
+            let modified = attrs?[.modificationDate] as? Date
             let state = (try? String(contentsOf: stateURL, encoding: .utf8)) ?? ""
-            if state == "running", let modified, modified >= armed {
+            if state == "running", let modified,
+               (modified >= armed.addingTimeInterval(-1.5) || (awaitingSystem && Date().timeIntervalSince(modified) < 4.0)) {
                 phoneArmedAt = nil
                 start()
             }
@@ -455,10 +553,10 @@ struct VoiceSession: Identifiable, Codable {
         guard isRunning, audioSource == .phone, !isPaused, let groupFolder else { return }
         let state = (try? String(contentsOf: groupFolder.appendingPathComponent("capture.state"),
                                  encoding: .utf8)) ?? ""
+        if !pip.isActuallyActive { pip.ensureStarted() }
         guard state == "running" || (state == "stopped" && observedBroadcast) else { return }
         if !observedBroadcast { startRecognitionTask() }
         observedBroadcast = true
-        if UIApplication.shared.applicationState != .active { pip.ensureStarted() }
         let files = ((try? FileManager.default.contentsOfDirectory(
             at: groupFolder, includingPropertiesForKeys: nil)) ?? [])
             .filter { $0.lastPathComponent.hasPrefix("voice-audio-") }
@@ -468,7 +566,7 @@ struct VoiceSession: Identifiable, Codable {
                let buffer = VoiceAudioPacket.decode(data) {
                 request?.append(buffer)
                 lastAudioAt = Date()
-                message = "正在收听手机声音（本机识别）"
+                message = useOnDeviceRecognition ? "正在收听手机声音（本机识别）" : "正在收听手机声音（在线识别）"
             }
             try? FileManager.default.removeItem(at: file)
         }
@@ -543,10 +641,10 @@ struct VoiceSession: Identifiable, Codable {
         request = nil; recognitionTask = nil
         if audioSource == .phone, let groupFolder {
             try? FileManager.default.removeItem(at: groupFolder.appendingPathComponent("voice.mode"))
-            if observedBroadcast {
-                try? "stop".write(to: groupFolder.appendingPathComponent("voice.stop"),
-                                  atomically: true, encoding: .utf8)
-            }
+            try? "stop".write(to: groupFolder.appendingPathComponent("voice.stop"),
+                              atomically: true, encoding: .utf8)
+            try? "stopped".write(to: groupFolder.appendingPathComponent("capture.state"),
+                                 atomically: true, encoding: .utf8)
         }
         pip.stop()
         phoneFinishing = false
@@ -1103,6 +1201,7 @@ struct VoiceStatusHeader: View {
         let title: String
         if model.isRunning { title = starting ? "正在开启画中画" : (model.isPaused ? "已暂停" : "正在听") }
         else if model.awaitingSystem { title = "等待系统确认" }
+        else if model.startError != nil { title = "无法开启字幕" }
         else { title = "准备收音" }
         let detail: String
         if model.isRunning {
@@ -1110,6 +1209,8 @@ struct VoiceStatusHeader: View {
                 : (model.audioSource == .phone ? "回到视频，字幕会出现在画中画小窗里。" : "对着手机讲话，字幕会实时出现。")
         } else if model.awaitingSystem {
             detail = "请在系统弹出的面板里点「开始直播」。"
+        } else if let error = model.startError {
+            detail = error
         } else {
             detail = model.audioSource == .phone
                 ? "点「开启字幕」，在系统面板里开始直播，就能识别手机里播放的声音。"
@@ -1125,6 +1226,7 @@ struct VoiceStatusHeader: View {
     private var title: String {
         if model.isRunning { return phoneStarting ? "正在开启画中画" : (model.isPaused ? "已暂停" : "正在听") }
         if model.awaitingSystem { return "等待系统确认" }
+        if model.startError != nil { return "无法开启字幕" }
         return "准备收音"
     }
     private var detail: String {
@@ -1133,12 +1235,14 @@ struct VoiceStatusHeader: View {
             return model.audioSource == .phone ? "回到视频，字幕会出现在画中画小窗里。" : "对着手机讲话，字幕会实时出现。"
         }
         if model.awaitingSystem { return "请在系统弹出的面板里点「开始直播」。" }
+        if let error = model.startError { return error }
         return model.audioSource == .phone
             ? "点「开启字幕」，在系统面板里开始直播，就能识别手机里播放的声音。"
             : "点「开启字幕」，识别身边的讲话并实时翻译。"
     }
     private var color: Color {
         if model.isRunning && !phoneStarting { return model.isPaused ? .orange : .green }
+        if !model.isRunning && !model.awaitingSystem && model.startError != nil { return .red }
         if busy { return .orange }
         return .gray
     }
@@ -1311,7 +1415,13 @@ struct VoiceHome: View {
                 .shadow(color: .black.opacity(0.55), radius: 2, y: 1)
         }
         } }
-        .task(id: "\(model.source.rawValue)|\(model.target.rawValue)") { await installedLanguages.refresh(source: model.source, target: model.target, speech: true) }
+        .task(id: "\(model.source.rawValue)|\(model.target.rawValue)") {
+            model.clearStartError()
+            if model.source != model.target {
+                MLKitEngine.shared.prepare(source: model.source.code ?? "en", target: model.target.code ?? "zh-Hans")
+            }
+            await installedLanguages.refresh(source: model.source, target: model.target, speech: true)
+        }
         .onReceive(NotificationCenter.default.publisher(for: .init("QingyiLanguagePacksChanged"))) { _ in Task { await installedLanguages.refresh(source: model.source, target: model.target, speech: true) } }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in Task { await installedLanguages.refresh(source: model.source, target: model.target, speech: true) } }
         .onAppear {
@@ -1532,8 +1642,12 @@ struct VoiceHome: View {
     }
 
     private func openVoicePicker() {
-        model.beginAwaitingSystem()
-        voicePickerTrigger += 1
+        Task { @MainActor in
+            let check = await model.preflightPhoneStart()
+            guard check.error == nil else { return }
+            model.beginAwaitingSystem()
+            voicePickerTrigger += 1
+        }
     }
 
     private func voiceMainButton(_ text: String, systemImage: String, color: Color, filled: Bool = true,
